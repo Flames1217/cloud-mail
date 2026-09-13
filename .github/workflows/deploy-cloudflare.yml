@@ -6,7 +6,12 @@ on:
     paths:
       - "mail-worker/**"
       - "mail-vue/**"
+      - ".github/workflows/deploy-cloudflare.yml"
   workflow_dispatch:
+
+concurrency:
+  group: cloud-mail-production
+  cancel-in-progress: false
 
 jobs:
   Deploy-cloud-mail:
@@ -220,13 +225,27 @@ jobs:
         working-directory: ./mail-worker
         run: |
           echo "🚀 Starting deployment..."
+          python3 - <<'PY'
+          import tomllib
+          with open('wrangler-action.toml', 'rb') as file:
+              config = tomllib.load(file)
+          with open('wrangler.toml', 'rb') as file:
+              default = tomllib.load(file)
+          for section, binding, key in [('d1_databases', 'db', 'database_id'), ('kv_namespaces', 'kv', 'id')]:
+              actual = next((item for item in config.get(section, []) if item['binding'] == binding), None)
+              expected = next((item for item in default.get(section, []) if item['binding'] == binding), None)
+              if not actual or not expected or not actual.get(key) or actual[key] != expected[key]:
+                  raise SystemExit(f'{binding}: Actions and default deployment must use the same configured resource')
+          print('D1 and KV configuration verified')
+          PY
+          set +e
           pnpm wrangler deploy -c wrangler-action.toml 2>&1 \
             | tee deploy.log \
             | grep -v "https://.*\.workers\.dev" \
-            | sed -E 's/env\.domain .*/env.domain (***)/' \
-            || true
+            | sed -E 's/env\.domain .*/env.domain (***)/'
           
           DEPLOY_EXIT_CODE=${PIPESTATUS[0]}
+          set -e
           if [ $DEPLOY_EXIT_CODE -ne 0 ]; then
             exit 1
           fi
@@ -263,9 +282,24 @@ jobs:
             exit 1
           fi
 
-      - name: 🗑️ 删除运行记录 / Delete workflow runs
-        uses: GitRML/delete-workflow-runs@main
-        continue-on-error: true
-        with:
-          retain_days: '1'
-          keep_minimum_runs: '0'
+      - name: 验证线上绑定 / Verify deployed bindings
+        working-directory: ./mail-worker
+        run: |
+          python3 - <<'PY'
+          import json, os, tomllib, urllib.request
+          with open('wrangler-action.toml', 'rb') as file:
+              config = tomllib.load(file)
+          url = f"https://api.cloudflare.com/client/v4/accounts/{os.environ['CLOUDFLARE_ACCOUNT_ID']}/workers/scripts/{config['name']}/settings"
+          request = urllib.request.Request(url, headers={'Authorization': 'Bearer ' + os.environ['CLOUDFLARE_API_TOKEN']})
+          with urllib.request.urlopen(request, timeout=30) as response:
+              data = json.load(response)
+          if not data.get('success'):
+              raise SystemExit('Unable to verify deployed Worker settings')
+          bindings = {item['name']: item for item in data['result']['bindings']}
+          for section, name, kind, actual_key, config_key in [('d1_databases', 'db', 'd1', 'id', 'database_id'), ('kv_namespaces', 'kv', 'kv_namespace', 'namespace_id', 'id')]:
+              expected = next(item for item in config[section] if item['binding'] == name)
+              actual = bindings.get(name, {})
+              if actual.get('type') != kind or actual.get(actual_key) != expected[config_key]:
+                  raise SystemExit(f'{name}: deployed binding is missing or points to the wrong resource')
+          print('Production db and kv bindings verified')
+          PY
